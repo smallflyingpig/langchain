@@ -4,6 +4,11 @@ from __future__ import annotations
 import logging
 import sys
 import warnings
+import os 
+import json
+import time
+import datetime
+import requests
 from typing import (
     AbstractSet,
     Any,
@@ -593,6 +598,428 @@ class BaseOpenAI(BaseLLM):
         num_tokens = self.get_num_tokens(prompt)
         return self.max_context_size - num_tokens
 
+
+class GPTRequest(object):
+    CHAT_BATCH_URL="http://heb.jd.com/bigdata/redirectUrlBatch"
+    def __init__(self, ERP, token, logger:logging.Logger=None):
+        self._ERP = ERP
+        self._token = token
+        self.logger = logger
+        self.print = self.logger if self.logger else print
+        print(self._ERP, self._token)
+
+    def _fetch_data_from_gpt(self, 
+                             question, 
+                             model="gpt-3.5-turbo", 
+                             URL="http://heb.jd.com/bigdata/redirectUrl",
+                             logger:logging.Logger=None):
+        print_this = logger.info if logger else self.print
+        data = {
+            "body": json.dumps({
+                "erp": self._ERP,
+                "model": model,
+                "usrId": self._token,
+                "messages": [
+                    {"role": "user", "content": question}
+                ]
+            })
+        }
+
+        try:
+            resp = requests.post(URL, data=data, timeout=(60, 300))
+            # print(resp.json())
+            if resp.ok:
+                res_json = resp.json()
+                if res_json["code"] == "0000":
+                    dd = json.loads(res_json["data"])
+                    if "choices" in dd:
+                        return json.loads(res_json["data"])["choices"][0]["message"]["content"], res_json["code"]
+                    else:
+                        print_this("ERROR:>>"+str(dd))
+                        return None, res_json['code']
+                elif res_json["code"] == "0001": # 超出流量限制
+                    print_this("exceed the limit!")
+                    print_this("ERROR:>>"+str(resp.json()))
+                    return None, res_json['code']
+                else:
+                    print_this("ERROR:>>"+str(resp.json()))
+                    return None, res_json['code']
+            else:
+                print_this("ERROR:>>"+str(resp.json()))
+                return None, 'Failed'
+        except Exception as e:
+            print_this("##ERROR##"+str(e))
+            return None, 'Exception'
+
+    def fetch_data(self, s, batch_url=None, max_try=10, logger:logging.Logger=None):
+        print_this = logger.info if logger else self.print
+        batch_url = batch_url if batch_url else self.CHAT_BATCH_URL
+        try_cnt = 0                                  
+        while try_cnt<max_try:
+            try_cnt += 1                                
+            res, rtn_code = self._fetch_data_from_gpt(s, URL=batch_url, logger=logger)
+            if res is None:
+                now_str = datetime.datetime.now().strftime("%H:%M:%S")
+                print(f"[{now_str}]failed with code: {rtn_code} res is None, try again {try_cnt}", flush=True)
+                print_this(f"[{now_str}]failed with code: {rtn_code} res is None, try again {try_cnt}")
+                if rtn_code=='0000':
+                    time.sleep(3.0)
+                    pass
+                else:
+                    if rtn_code == '0001':
+                        time.sleep(60*60)
+                    elif rtn_code == 'Failed':
+                        time.sleep(10.0)
+                    elif rtn_code == 'Exception':
+                        time.sleep(1.0)
+                    else: # 0000
+                        time.sleep(3.0)
+            else: # data is valid
+                break
+            now_str = datetime.datetime.now().strftime("%H:%M:%S")
+            if now_str>"20:00:00" or now_str<"09:00:00":
+                time.sleep(1.0+2*try_cnt)
+            else:
+                time.sleep(10.0+5*try_cnt)
+        return res  
+
+class JDHOpenAI(BaseOpenAI):
+    """
+    Wrapper around OpenAI large language models.
+
+    """
+    # gpt_request:GPTRequest
+    def __new__(cls, **data: Any) -> Union[OpenAIChat, BaseOpenAI]:  # type: ignore
+        """Initialize the OpenAI object."""
+        model_name = data.get("model_name", "")
+        if model_name.startswith("gpt-3.5-turbo") or model_name.startswith("gpt-4"):
+            warnings.warn(
+                "You are trying to use a chat model. This way of initializing it is "
+                "no longer supported. Instead, please use: "
+                "`from langchain.chat_models import ChatOpenAI`"
+            )
+            return OpenAIChat(**data)
+    
+    
+        cls.gpt_request = GPTRequest(get_from_dict_or_env(
+            data,
+            "jd_erp",
+            "JD_ERP",
+            default="",
+        ), get_from_dict_or_env(
+            data,
+            "jd_token",
+            "JD_TOKEN",
+            default="",
+        ))
+
+        return super().__new__(cls)
+
+    def _generate(
+        self,
+        prompts: List[str],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+    ) -> LLMResult:
+        """Call out to OpenAI's endpoint with k unique prompts.
+
+        Args:
+            prompts: The prompts to pass into the model.
+            stop: Optional list of stop words to use when generating.
+
+        Returns:
+            The full LLM output.
+
+        Example:
+            .. code-block:: python
+
+                response = openai.generate(["Tell me a joke."])
+        """
+        # TODO: write a unit test for this
+        params = self._invocation_params
+        sub_prompts = self.get_sub_prompts(params, prompts, stop)
+        choices = []
+        token_usage: Dict[str, int] = {}
+        # Get the token usage from the response.
+        # Includes prompt, completion, and total tokens used.
+        _keys = {"completion_tokens", "prompt_tokens", "total_tokens"}
+        for _prompts in sub_prompts:
+            if self.streaming: # not support
+                if len(_prompts) > 1:
+                    raise ValueError("Cannot stream results with multiple prompts.")
+                params["stream"] = True
+                response = _streaming_response_template()
+                for stream_resp in completion_with_retry(
+                    self, prompt=_prompts, **params
+                ):
+                    if run_manager:
+                        run_manager.on_llm_new_token(
+                            stream_resp["choices"][0]["text"],
+                            verbose=self.verbose,
+                            logprobs=stream_resp["choices"][0]["logprobs"],
+                        )
+                    _update_response(response, stream_resp)
+                choices.extend(response["choices"])
+            else:
+                # print(_prompts, params)
+                rtn_str = self.gpt_request.fetch_data(_prompts[0])
+                if rtn_str is not None:
+                    response = {
+                        "choices": [{'text':rtn_str, 'logprobs': 1.0, "finish_reason": "success"}], 
+                        'usage': [len(rtn_str)],
+                        }
+                else:
+                    response = {
+                        "choices": [{'text':"", 'logprobs': 1.0, "finish_reason": "failed"}], 
+                        'usage': [0],
+                        }
+                choices.extend(response["choices"])
+                
+            if not self.streaming:
+                # Can't update token usage if streaming
+                update_token_usage(_keys, response, token_usage)
+        return self.create_llm_result(choices, prompts, token_usage)
+
+    @root_validator()
+    def validate_environment(cls, values: Dict) -> Dict:
+        """Validate that api key and python package exists in environment."""
+
+        jd_erp = get_from_dict_or_env(
+            values,
+            "jd_erp",
+            "JD_ERP",
+            default="",
+        )
+        os.environ['JD_ERP'] = jd_erp
+        jd_token = get_from_dict_or_env(
+            values,
+            "jd_token",
+            "JD_TOKEN",
+            default="",
+        )
+        os.environ['JD_TOKEN'] = jd_token
+
+        if values["streaming"] and values["n"] > 1:
+            raise ValueError("Cannot stream results when n > 1.")
+        if values["streaming"] and values["best_of"] > 1:
+            raise ValueError("Cannot stream results when best_of > 1.")
+        return values
+
+    @property
+    def _invocation_params(self) -> Dict[str, Any]:
+        return {**{"model": self.model_name}, **super()._invocation_params}
+    
+
+class GPTRequest(object):
+    CHAT_BATCH_URL="http://heb.jd.com/bigdata/redirectUrlBatch"
+    def __init__(self, ERP, token, logger:logging.Logger=None):
+        self._ERP = ERP
+        self._token = token
+        self.logger = logger
+        self.print = self.logger if self.logger else print
+        print(self._ERP, self._token)
+
+    def _fetch_data_from_gpt(self, 
+                             question, 
+                             model="gpt-3.5-turbo", 
+                             URL="http://heb.jd.com/bigdata/redirectUrl",
+                             logger:logging.Logger=None):
+        print_this = logger.info if logger else self.print
+        data = {
+            "body": json.dumps({
+                "erp": self._ERP,
+                "model": model,
+                "usrId": self._token,
+                "messages": [
+                    {"role": "user", "content": question}
+                ]
+            })
+        }
+
+        try:
+            resp = requests.post(URL, data=data, timeout=(60, 300))
+            # print(resp.json())
+            if resp.ok:
+                res_json = resp.json()
+                if res_json["code"] == "0000":
+                    dd = json.loads(res_json["data"])
+                    if "choices" in dd:
+                        return json.loads(res_json["data"])["choices"][0]["message"]["content"], res_json["code"]
+                    else:
+                        print_this("ERROR:>>"+str(dd))
+                        return None, res_json['code']
+                elif res_json["code"] == "0001": # 超出流量限制
+                    print_this("exceed the limit!")
+                    print_this("ERROR:>>"+str(resp.json()))
+                    return None, res_json['code']
+                else:
+                    print_this("ERROR:>>"+str(resp.json()))
+                    return None, res_json['code']
+            else:
+                print_this("ERROR:>>"+str(resp.json()))
+                return None, 'Failed'
+        except Exception as e:
+            print_this("##ERROR##"+str(e))
+            return None, 'Exception'
+
+    def fetch_data(self, s, batch_url=None, max_try=10, logger:logging.Logger=None):
+        print_this = logger.info if logger else self.print
+        batch_url = batch_url if batch_url else self.CHAT_BATCH_URL
+        try_cnt = 0                                  
+        while try_cnt<max_try:
+            try_cnt += 1                                
+            res, rtn_code = self._fetch_data_from_gpt(s, URL=batch_url, logger=logger)
+            if res is None:
+                now_str = datetime.datetime.now().strftime("%H:%M:%S")
+                print(f"[{now_str}]failed with code: {rtn_code} res is None, try again {try_cnt}", flush=True)
+                print_this(f"[{now_str}]failed with code: {rtn_code} res is None, try again {try_cnt}")
+                if rtn_code=='0000':
+                    time.sleep(3.0)
+                    pass
+                else:
+                    if rtn_code == '0001':
+                        time.sleep(60*60)
+                    elif rtn_code == 'Failed':
+                        time.sleep(10.0)
+                    elif rtn_code == 'Exception':
+                        time.sleep(1.0)
+                    else: # 0000
+                        time.sleep(3.0)
+            else: # data is valid
+                break
+            now_str = datetime.datetime.now().strftime("%H:%M:%S")
+            if now_str>"20:00:00" or now_str<"09:00:00":
+                time.sleep(1.0+2*try_cnt)
+            else:
+                time.sleep(10.0+5*try_cnt)
+        return res  
+
+class JDHOpenAI(BaseOpenAI):
+    """
+    Wrapper around OpenAI large language models.
+
+    """
+    # gpt_request:GPTRequest
+    def __new__(cls, **data: Any) -> Union[OpenAIChat, BaseOpenAI]:  # type: ignore
+        """Initialize the OpenAI object."""
+        model_name = data.get("model_name", "")
+        if model_name.startswith("gpt-3.5-turbo") or model_name.startswith("gpt-4"):
+            warnings.warn(
+                "You are trying to use a chat model. This way of initializing it is "
+                "no longer supported. Instead, please use: "
+                "`from langchain.chat_models import ChatOpenAI`"
+            )
+            return OpenAIChat(**data)
+    
+    
+        cls.gpt_request = GPTRequest(get_from_dict_or_env(
+            data,
+            "jd_erp",
+            "JD_ERP",
+            default="",
+        ), get_from_dict_or_env(
+            data,
+            "jd_token",
+            "JD_TOKEN",
+            default="",
+        ))
+
+        return super().__new__(cls)
+
+    def _generate(
+        self,
+        prompts: List[str],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+    ) -> LLMResult:
+        """Call out to OpenAI's endpoint with k unique prompts.
+
+        Args:
+            prompts: The prompts to pass into the model.
+            stop: Optional list of stop words to use when generating.
+
+        Returns:
+            The full LLM output.
+
+        Example:
+            .. code-block:: python
+
+                response = openai.generate(["Tell me a joke."])
+        """
+        # TODO: write a unit test for this
+        params = self._invocation_params
+        sub_prompts = self.get_sub_prompts(params, prompts, stop)
+        choices = []
+        token_usage: Dict[str, int] = {}
+        # Get the token usage from the response.
+        # Includes prompt, completion, and total tokens used.
+        _keys = {"completion_tokens", "prompt_tokens", "total_tokens"}
+        for _prompts in sub_prompts:
+            if self.streaming: # not support
+                if len(_prompts) > 1:
+                    raise ValueError("Cannot stream results with multiple prompts.")
+                params["stream"] = True
+                response = _streaming_response_template()
+                for stream_resp in completion_with_retry(
+                    self, prompt=_prompts, **params
+                ):
+                    if run_manager:
+                        run_manager.on_llm_new_token(
+                            stream_resp["choices"][0]["text"],
+                            verbose=self.verbose,
+                            logprobs=stream_resp["choices"][0]["logprobs"],
+                        )
+                    _update_response(response, stream_resp)
+                choices.extend(response["choices"])
+            else:
+                # print(_prompts, params)
+                rtn_str = self.gpt_request.fetch_data(_prompts[0])
+                if rtn_str is not None:
+                    response = {
+                        "choices": [{'text':rtn_str, 'logprobs': 1.0, "finish_reason": "success"}], 
+                        'usage': [len(rtn_str)],
+                        }
+                else:
+                    response = {
+                        "choices": [{'text':"", 'logprobs': 1.0, "finish_reason": "failed"}], 
+                        'usage': [0],
+                        }
+                choices.extend(response["choices"])
+                
+            if not self.streaming:
+                # Can't update token usage if streaming
+                update_token_usage(_keys, response, token_usage)
+        return self.create_llm_result(choices, prompts, token_usage)
+
+    @root_validator()
+    def validate_environment(cls, values: Dict) -> Dict:
+        """Validate that api key and python package exists in environment."""
+
+        jd_erp = get_from_dict_or_env(
+            values,
+            "jd_erp",
+            "JD_ERP",
+            default="",
+        )
+        os.environ['JD_ERP'] = jd_erp
+        jd_token = get_from_dict_or_env(
+            values,
+            "jd_token",
+            "JD_TOKEN",
+            default="",
+        )
+        os.environ['JD_TOKEN'] = jd_token
+
+        if values["streaming"] and values["n"] > 1:
+            raise ValueError("Cannot stream results when n > 1.")
+        if values["streaming"] and values["best_of"] > 1:
+            raise ValueError("Cannot stream results when best_of > 1.")
+        return values
+
+    @property
+    def _invocation_params(self) -> Dict[str, Any]:
+        return {**{"model": self.model_name}, **super()._invocation_params}
+    
 
 class OpenAI(BaseOpenAI):
     """Wrapper around OpenAI large language models.
